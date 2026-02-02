@@ -1,155 +1,237 @@
 use std::collections::HashMap;
-use std::io::{self, Read, Write, ErrorKind};
+use std::io::{self, Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
-/// ===============================
-/// Core byte-stream abstractions
-/// ===============================
+const MAX_MESSAGE_SIZE: usize = 1_000_000; // 1 MB
+const KEY: u8 = 42; // Only for educational display
 
-/// Plain (unencrypted) byte stream
-pub struct PlainBytes {
-    bytes: Vec<u8>,
-    pos: usize,
+// ============================================================
+// Pragmatically pure utility functions (no I/O, no side effects)
+// ============================================================
+
+fn xor_transform(data: &[u8], key: u8) -> Vec<u8> {
+    data.iter().map(|&b| b ^ key).collect()
 }
 
-/// Encrypted byte stream (XOR lazy encryption)
-#[derive(Clone)]
-pub struct EncryptedBytes {
-    bytes: Vec<u8>,
-    pos: usize,
-    key: u8,
+fn bytes_to_hex(bytes: &[u8]) -> String {
+    bytes.iter()
+        .map(|b| format!("{:02x}", b))
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
-impl PlainBytes {
-    pub fn read_all(mut self) -> Vec<u8> {
-        let mut out = Vec::new();
-        while self.pos < self.bytes.len() {
-            out.push(self.bytes[self.pos]);
-            self.pos += 1;
-        }
-        out
-    }
-
-    pub fn encrypt(self, key: u8) -> EncryptedBytes {
-        EncryptedBytes {
-            bytes: self.bytes,
-            pos: 0,
-            key,
-        }
-    }
+fn decrypt_for_display(encrypted: &[u8]) -> String {
+    xor_transform(encrypted, KEY)
+        .into_iter()
+        .map(|b| b as char)
+        .collect()
 }
 
-impl EncryptedBytes {
-    pub fn read_all(mut self) -> Vec<u8> {
-        let mut out = Vec::new();
-        while self.pos < self.bytes.len() {
-            out.push(self.bytes[self.pos] ^ self.key);
-            self.pos += 1;
-        }
-        out
-    }
-
-    pub fn decrypt(self, key: u8) -> Result<PlainBytes, EncryptedBytes> {
-        if self.key == key {
-            Ok(PlainBytes { bytes: self.bytes, pos: 0 })
-        } else {
-            Err(self)
-        }
-    }
+fn prepend_username(username: &str, encrypted_msg: &[u8]) -> Vec<u8> {
+    let prefix = format!("{}: ", username);
+    xor_transform(prefix.as_bytes(), KEY)
+        .into_iter()
+        .chain(encrypted_msg.iter().copied())
+        .collect()
 }
 
-/// ===============================
-/// TCP framing helpers
-/// ===============================
-
-fn send_message(stream: &mut TcpStream, encrypted: EncryptedBytes) -> io::Result<()> {
-    let payload = encrypted.read_all();
-    let len = payload.len() as u32;
-    stream.write_all(&len.to_be_bytes())?;
-    stream.write_all(&payload)?;
-    Ok(())
+fn create_system_message(text: String) -> Vec<u8> {
+    xor_transform(text.as_bytes(), KEY)
 }
 
-fn receive_message(stream: &mut TcpStream, key: u8) -> io::Result<String> {
+// ============================================================
+// I/O functions (ordered by dependency)
+// ============================================================
+
+fn read_message_length<R: Read>(reader: &mut R) -> io::Result<usize> {
     let mut len_buf = [0u8; 4];
-    stream.read_exact(&mut len_buf)?;
-    let len = u32::from_be_bytes(len_buf) as usize;
-
-    let mut payload = vec![0u8; len];
-    stream.read_exact(&mut payload)?;
-
-    let encrypted = EncryptedBytes { bytes: payload, pos: 0, key };
-
-    let plain = match encrypted.decrypt(key) {
-        Ok(p) => p,
-        Err(_) => {
-            eprintln!("Received message with invalid key");
-            return Err(io::Error::new(ErrorKind::InvalidData, "Invalid encryption key"));
-        }
-    };
-
-    let bytes = plain.read_all();
-    Ok(String::from_utf8(bytes).unwrap())
+    reader.read_exact(&mut len_buf)?;
+    Ok(u32::from_be_bytes(len_buf) as usize)
 }
 
-/// ===============================
-/// Chat server logic
-/// ===============================
+fn read_encrypted_bytes<R: Read>(reader: &mut R, len: usize) -> io::Result<Vec<u8>> {
+    let mut encrypted = vec![0u8; len];
+    reader.read_exact(&mut encrypted)?;
+    Ok(encrypted)
+}
 
-type Clients = Arc<Mutex<HashMap<String, TcpStream>>>;
+fn receive_encrypted_message<R: Read>(reader: &mut R) -> io::Result<Vec<u8>> {
+    let len = read_message_length(reader)?;
 
-fn handle_client(mut stream: TcpStream, clients: Clients, key: u8) {
-    // Receive username first
-    let username = match receive_message(&mut stream, key) {
-        Ok(u) => u,
-        Err(_) => return,
-    };
-    println!("{} joined", username);
+    match len <= MAX_MESSAGE_SIZE {
+        false => Err(io::Error::new(io::ErrorKind::InvalidData, "Message too large")),
+        true => read_encrypted_bytes(reader, len)
+    }
+}
 
-    // Register client
-    clients.lock().unwrap().insert(username.clone(), stream.try_clone().unwrap());
+fn send_encrypted_message<W: Write>(writer: &mut W, encrypted: &[u8]) -> io::Result<()> {
+    let len = encrypted.len() as u32;
+    writer.write_all(&len.to_be_bytes())
+        .and_then(|_| writer.write_all(encrypted))
+        .and_then(|_| writer.flush())
+}
 
-    // Main message loop
-    loop {
-        let msg = match receive_message(&mut stream, key) {
-            Ok(m) => m,
-            Err(_) => break,
-        };
+// ============================================================
+// Display functions
+// ============================================================
 
-        println!("{}: {}", username, msg);
+fn display_encrypted(username: &str, encrypted: &[u8], prefix: &str) {
+    println!("{} {}: [ENCRYPTED HEX] {}", prefix, username, bytes_to_hex(encrypted));
+    println!("{} {}: [DECRYPTED]     {}", prefix, username, decrypt_for_display(encrypted));
+}
 
-        let response = PlainBytes {
-            bytes: format!("{}: {}", username, msg).into_bytes(),
-            pos: 0,
-        }
-            .encrypt(key);
+// ============================================================
+// Type aliases (for clarity)
+// ============================================================
 
-        // Broadcast to all other clients
-        let clients_map = clients.lock().unwrap();
-        for (name, client) in clients_map.iter() {
-            if name != &username {
-                let _ = send_message(&mut client.try_clone().unwrap(), response.clone());
-            }
+type ClientSender = Sender<Vec<u8>>;
+type ClientMap = Arc<Mutex<HashMap<String, ClientSender>>>;
+
+// ============================================================
+// Business logic functions
+// ============================================================
+
+fn extract_username(encrypted: &[u8]) -> Option<String> {
+    let username = decrypt_for_display(encrypted);
+    match username.trim().is_empty() {
+        true => None,
+        false => Some(username)
+    }
+}
+
+fn register_client(clients: &ClientMap, username: String, sender: ClientSender) -> Result<(), String> {
+    let mut map = clients.lock().unwrap();
+    match map.contains_key(&username) {
+        true => Err(format!("Username {} already taken", username)),
+        false => {
+            map.insert(username, sender);
+            Ok(())
         }
     }
+}
 
-    // Cleanup
+fn broadcast_to_others(clients: &ClientMap, sender_name: &str, message: Vec<u8>) {
+    clients.lock().unwrap()
+        .iter()
+        .filter(|(name, _)| *name != sender_name)
+        .for_each(|(_, sender)| {
+            sender.send(message.clone()).ok();
+        });
+}
+
+fn broadcast_to_all(clients: &ClientMap, message: Vec<u8>) {
+    clients.lock().unwrap()
+        .values()
+        .for_each(|sender| {
+            sender.send(message.clone()).ok();
+        });
+}
+
+// ============================================================
+// Thread management
+// ============================================================
+
+fn spawn_sender_thread(mut writer: TcpStream, rx: mpsc::Receiver<Vec<u8>>) {
+    thread::spawn(move || {
+        rx.into_iter()
+            .try_for_each(|encrypted_msg| send_encrypted_message(&mut writer, &encrypted_msg))
+            .ok();
+    });
+}
+
+// ============================================================
+// Client handler (uses all above functions)
+// ============================================================
+
+fn handle_client(mut stream: TcpStream, clients: ClientMap) {
+    // Receive and validate username
+    let username = receive_encrypted_message(&mut stream)
+        .ok()
+        .and_then(|data| extract_username(&data))
+        .filter(|name| !name.is_empty());
+
+    let username = match username {
+        Some(name) => name,
+        None => {
+            eprintln!("Failed to receive valid username");
+            return;
+        }
+    };
+
+    println!("\n>>> {} joined", username);
+
+    // Create channel and register client - PATTERN MATCHED VERSION
+    let (tx, rx) = mpsc::channel::<Vec<u8>>();
+
+    match register_client(&clients, username.clone(), tx) {
+        Err(e) => {
+            eprintln!("{}", e);
+            return;
+        }
+        Ok(_) => ()
+    }
+
+    // Broadcast join message
+    let join_msg = create_system_message(format!("{} joined", username));
+    broadcast_to_others(&clients, &username, join_msg);
+
+    // Spawn sender thread
+    let writer = stream.try_clone().expect("clone failed");
+    spawn_sender_thread(writer, rx);
+
+    // Main receive loop - functional style
+    std::iter::from_fn(|| receive_encrypted_message(&mut stream).ok())
+        .filter(|msg| !msg.is_empty())
+        .try_for_each(|encrypted_msg| {
+            // Display encrypted and decrypted for educational purposes
+            display_encrypted(&username, &encrypted_msg, ">>>");
+
+            // Relay encrypted message with username prefix
+            let broadcast = prepend_username(&username, &encrypted_msg);
+            broadcast_to_others(&clients, &username, broadcast);
+
+            Ok::<(), ()>(())
+        })
+        .ok();
+
+    // Cleanup on disconnect
     clients.lock().unwrap().remove(&username);
-    println!("{} disconnected", username);
+    println!("\n<<< {} disconnected", username);
+
+    // Broadcast leave message
+    let leave_msg = create_system_message(format!("{} left", username));
+    broadcast_to_all(&clients, leave_msg);
 }
 
-fn main() {
-    let key = 42;
-    let clients: Clients = Arc::new(Mutex::new(HashMap::new()));
-    let listener = TcpListener::bind("0.0.0.0:5555").expect("bind failed");
-    println!("Chat server running on port 5555");
+// ============================================================
+// Main entry point
+// ============================================================
 
-    for stream in listener.incoming() {
-        if let Ok(stream) = stream {
+fn main() -> io::Result<()> {
+    let clients: ClientMap = Arc::new(Mutex::new(HashMap::new()));
+
+    let listener = TcpListener::bind("0.0.0.0:5555")?;
+
+    println!("╔════════════════════════════════════════════════════════════════╗");
+    println!("║          Chat Server - Educational Mode                       ║");
+    println!("╠════════════════════════════════════════════════════════════════╣");
+    println!("║  Port: 5555                                                    ║");
+    println!("║  Status: Running                                               ║");
+    println!("║                                                                ║");
+    println!("║  NOTE: Messages displayed in both ENCRYPTED and DECRYPTED      ║");
+    println!("║        forms for educational purposes only.                    ║");
+    println!("║        In production, server should NEVER see plaintext!       ║");
+    println!("╚════════════════════════════════════════════════════════════════╝\n");
+
+    listener.incoming()
+        .filter_map(Result::ok)
+        .for_each(|stream| {
             let clients = Arc::clone(&clients);
-            thread::spawn(move || handle_client(stream, clients, key));
-        }
-    }
+            thread::spawn(move || handle_client(stream, clients));
+        });
+
+    Ok(())
 }
