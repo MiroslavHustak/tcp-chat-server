@@ -3,7 +3,6 @@
 // ============================================================
 // This server demonstrates:
 // - End-to-end encryption (server relays encrypted messages)
-// - Functional programming patterns in Rust (similar to F#)
 // - Thread-per-client architecture
 // - Message-passing between threads (mpsc channels)
 // - Shared state with Arc<Mutex<T>>
@@ -33,10 +32,8 @@ const MAX_MESSAGE_SIZE: usize = 1_000_000;
 const KEY: u8 = 42;
 
 // ============================================================
-// Pure utility functions (no I/O, no side effects)
+// Pragmatically pure utility functions (no I/O, no side effects)
 // ============================================================
-// These functions are "pure" - they transform data without
-// performing I/O or modifying global state.
 // Organized in dependency order (F# style).
 // ============================================================
 
@@ -111,10 +108,7 @@ fn create_system_message(text: String) -> Vec<u8> {
 // ============================================================
 // I/O functions (ordered by dependency)
 // ============================================================
-// These handle network I/O. Organized so simpler functions
-// come first, and more complex functions that use them come later.
-// ============================================================
-
+///
 /// Read message length from stream (first 4 bytes)
 ///
 /// Protocol: Each message is prefixed with its length as 4-byte big-endian u32
@@ -146,7 +140,6 @@ fn read_encrypted_bytes<R: Read>(reader: &mut R, len: usize) -> io::Result<Vec<u
 /// 3. Read encrypted bytes
 ///
 /// Note: Server does NOT decrypt! Returns encrypted bytes.
-/// Uses pattern matching instead of if-else (F# style).
 fn receive_encrypted_message<R: Read>(reader: &mut R) -> io::Result<Vec<u8>> {
     let len = read_message_length(reader)?;
 
@@ -251,7 +244,6 @@ fn register_client(clients: &ClientMap, username: String, sender: ClientSender) 
 
 /// Broadcast message to all clients except sender
 ///
-/// Uses functional iteration instead of for loops.
 /// Filters out sender, then sends to everyone else.
 ///
 /// # Arguments
@@ -323,8 +315,6 @@ fn spawn_sender_thread(mut writer: TcpStream, rx: mpsc::Receiver<Vec<u8>>) {
 /// 4. Receives messages from client in loop
 /// 5. Broadcasts messages to other clients
 /// 6. Cleans up on disconnect
-///
-/// Uses functional patterns throughout (no explicit loops!).
 ///
 /// # Arguments
 /// * `stream` - TCP connection to this client
