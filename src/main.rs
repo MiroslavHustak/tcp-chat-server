@@ -1,5 +1,5 @@
 // ============================================================
-// Secure Chat Server (Option A)
+// Chat Server
 // ============================================================
 // Characteristics:
 // - NEVER decrypts chat messages
