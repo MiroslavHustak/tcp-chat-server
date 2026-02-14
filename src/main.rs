@@ -7,7 +7,12 @@
 // - Relays ciphertext verbatim
 // - NO ciphertext concatenation
 // - Iterator-based receive loop
+// - Argon2 key derivation with random salt
+// - Salt is generated once at startup and sent to each client
+//   in plaintext before any encrypted traffic begins
 // ============================================================
+
+// cargo build --release
 
 use std::collections::HashMap;
 use std::io::{self, Read, Write};
@@ -16,16 +21,40 @@ use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 
 use sodiumoxide::crypto::secretbox;
-use sodiumoxide::crypto::hash::sha256;
+use sodiumoxide::crypto::pwhash;
 
 // ============================================================
 // Utilities
 // ============================================================
 
-fn derive_key_from_passphrase(passphrase: &str) -> secretbox::Key {
-    let hash = sha256::hash(passphrase.as_bytes());
-    secretbox::Key::from_slice(&hash.0)
-        .expect("SHA-256 always produces 32 bytes")
+/// Derives a secretbox key from a passphrase and a salt using Argon2id.
+///
+/// The salt is generated once on the server at startup and sent to
+/// every client in plaintext before any encrypted traffic begins.
+/// Salt does not need to be secret — its purpose is to ensure that
+/// even identical passphrases produce different keys per deployment.
+fn derive_key_from_passphrase(passphrase: &str, salt: &pwhash::Salt) -> secretbox::Key {
+    let mut key_bytes = [0u8; secretbox::KEYBYTES];
+
+    pwhash::derive_key(
+        &mut key_bytes,
+        passphrase.as_bytes(),
+        salt,
+        pwhash::OPSLIMIT_INTERACTIVE, // ~0.5 seconds on modern hardware
+        pwhash::MEMLIMIT_INTERACTIVE, // ~64 MB RAM — too costly to brute-force
+    )
+        .expect("Argon2 key derivation failed");
+
+    secretbox::Key(key_bytes)
+}
+
+/// Sends the raw salt bytes to the client in plaintext.
+/// Salt is not secret — it just needs to reach the client before
+/// any encrypted traffic so both sides derive the same key.
+fn send_salt<W: Write>(writer: &mut W, salt: &pwhash::Salt) -> io::Result<()> {
+    writer
+        .write_all(&salt.0)
+        .and_then(|_| writer.flush())
 }
 
 fn read_message_length<R: Read>(reader: &mut R) -> io::Result<usize> {
@@ -42,7 +71,8 @@ fn receive_encrypted_message<R: Read>(reader: &mut R) -> io::Result<Vec<u8>> {
 }
 
 fn send_encrypted_message<W: Write>(writer: &mut W, encrypted: &[u8]) -> io::Result<()> {
-    writer.write_all(&(encrypted.len() as u32).to_be_bytes())
+    writer
+        .write_all(&(encrypted.len() as u32).to_be_bytes())
         .and_then(|_| writer.write_all(encrypted))
         .and_then(|_| writer.flush())
 }
@@ -81,7 +111,18 @@ type ClientMap = Arc<Mutex<HashMap<String, ClientSender>>>;
 // Client handler
 // ============================================================
 
-fn handle_client(mut stream: TcpStream, clients: ClientMap, key: secretbox::Key) {
+fn handle_client(
+    mut stream: TcpStream,
+    clients: ClientMap,
+    key: secretbox::Key,
+    salt: pwhash::Salt,
+) {
+    // ===== Send salt to client before any encrypted traffic =====
+    match send_salt(&mut stream, &salt) {
+        Ok(_)  => (),
+        Err(_) => return,
+    }
+
     // ===== Receive encrypted username =====
     let username = receive_encrypted_message(&mut stream)
         .ok()
@@ -89,7 +130,7 @@ fn handle_client(mut stream: TcpStream, clients: ClientMap, key: secretbox::Key)
 
     let username = match username {
         Some(name) => name,
-        None => return,
+        None       => return,
     };
 
     println!(">>> {} joined", username);
@@ -105,16 +146,22 @@ fn handle_client(mut stream: TcpStream, clients: ClientMap, key: secretbox::Key)
             .ok();
     });
 
+    thread::sleep(std::time::Duration::from_millis(100));
+
     // ===== Broadcast join =====
     let join = encrypt_system_message(&format!("{} joined", username), &key);
-    clients.lock().unwrap()
+    clients
+        .lock()
+        .unwrap()
         .values()
         .for_each(|tx| { tx.send(join.clone()).ok(); });
 
     // ===== Receive loop =====
     std::iter::from_fn(|| receive_encrypted_message(&mut stream).ok())
         .for_each(|encrypted| {
-            clients.lock().unwrap()
+            clients
+                .lock()
+                .unwrap()
                 .iter()
                 .filter(|(name, _)| *name != &username)
                 .for_each(|(_, tx)| {
@@ -127,7 +174,9 @@ fn handle_client(mut stream: TcpStream, clients: ClientMap, key: secretbox::Key)
     println!("<<< {} left", username);
 
     let leave = encrypt_system_message(&format!("{} left", username), &key);
-    clients.lock().unwrap()
+    clients
+        .lock()
+        .unwrap()
         .values()
         .for_each(|tx| { tx.send(leave.clone()).ok(); });
 }
@@ -144,17 +193,30 @@ fn main() -> io::Result<()> {
 
     let mut passphrase = String::new();
     io::stdin().read_line(&mut passphrase)?;
-    let key = derive_key_from_passphrase(passphrase.trim());
+
+    // Generate a fresh random salt once at server startup.
+    // Every client that connects receives this salt in plaintext
+    // so they can derive the same key from the shared passphrase.
+    let salt = pwhash::gen_salt();
+
+    println!("Deriving key (Argon2id)...");
+    let key = derive_key_from_passphrase(passphrase.trim(), &salt);
+    println!("Key ready. Listening on 0.0.0.0:5555");
 
     let listener = TcpListener::bind("0.0.0.0:5555")?;
+    println!(">>> TCP chat listening on 0.0.0.0:5555");
+    println!(">>> Waiting for connections...");
+
     let clients: ClientMap = Arc::new(Mutex::new(HashMap::new()));
 
-    listener.incoming()
+    listener
+        .incoming()
         .filter_map(Result::ok)
         .for_each(|stream| {
             let clients = Arc::clone(&clients);
-            let key = key.clone();
-            thread::spawn(move || handle_client(stream, clients, key));
+            let key     = key.clone();
+            let salt    = salt.clone();
+            thread::spawn(move || handle_client(stream, clients, key, salt));
         });
 
     Ok(())
