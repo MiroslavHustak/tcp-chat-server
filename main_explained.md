@@ -543,4 +543,68 @@ sodiumoxide::init().expect("Failed to initialize libsodium");
 
     Ok(())
 }
+
+## The Writer Thread Pattern
+
+This code solves a fundamental problem: **one TCP stream, two threads** (the reader thread and a writer thread) need to use it simultaneously.
+
+### The Problem It Solves
+
+After this point, the main client thread needs to:
+- **Read** incoming messages from `stream` (the relay loop below)
+- **Write** outgoing messages to `stream` (broadcasts from other clients)
+
+But a single `TcpStream` can't be in two places at once — so we split it.
+
+---
+
+### Line by Line
+
+```rust
+let mut writer = stream.try_clone().expect("clone failed");
+```
+
+`try_clone()` duplicates the TCP socket at the OS level. Both `stream` and `writer` point to the **same underlying TCP connection**, but are now two separate handles. It's like having two file descriptors for the same file — reads and writes through either one go to the same connection.
+
+```rust
+thread::spawn(move || {
+```
+
+Spawns a new thread. The `move` keyword **transfers ownership** of `writer` and `rx` into the closure — the spawned thread owns them exclusively, which satisfies Rust's borrow checker.
+
+```rust
+    rx.into_iter()
+```
+
+Converts the `Receiver<Vec<u8>>` into a blocking iterator. Each call to `.next()` **blocks until a message arrives** on the channel, or returns `None` when the `Sender` side is dropped (meaning the client disconnected and cleanup ran). This is the thread's entire purpose — sit and wait for messages.
+
+```rust
+        .try_for_each(|msg| send_message(&mut writer, &msg))
+```
+
+For each message that arrives, call `send_message`, which writes it to the TCP stream. `try_for_each` is like `for_each` but **short-circuits on the first error** — if writing fails (client disconnected), the iterator stops immediately rather than continuing to try sending into a broken socket.
+
+```rust
+        .ok();
+```
+
+Discards the final `Result` — we don't care whether it ended cleanly or with an error, the thread just exits either way.
+
+---
+
+### The Architecture This Creates
+
+```
+Other clients
+     │
+     │  tx.send(msg)          rx.into_iter()
+     └──────────────► [channel] ──────────────► writer thread ──► TCP socket
+                                                                        ║
+main client thread ◄──────────────────────────────────────────────────╝
+(read_message loop)
+```
+
+The channel acts as the **mailbox** (exactly like an F# `MailboxProcessor`). Any thread can drop a message in via `tx.send()` without caring about timing. The writer thread drains the mailbox sequentially, ensuring messages don't get interleaved on the wire.
+
+The main thread keeps `stream` and reads from it, while this spawned thread owns `writer` and writes to it — clean separation, no shared mutable state.
 */

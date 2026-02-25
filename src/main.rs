@@ -63,7 +63,8 @@ fn handle_client(
     clients: ClientMap,
     key: secretbox::Key,
     salt: pwhash::Salt,
-) {
+) -> () {
+    //-> () does not have to be here as it's the default
     /// Sends the raw salt bytes to the client in plaintext.
     /// Salt is not secret — it just needs to reach the client before
     /// any encrypted traffic so both sides derive the same key.
@@ -152,8 +153,8 @@ fn handle_client(
         So the nonce is the first chunk of the encrypted buffer. The rest is the actual ciphertext.
         */
         secretbox::open(&encrypted[secretbox::NONCEBYTES..], &nonce, key)
-            .ok()
-            .and_then(|p| String::from_utf8(p).ok())
+            .ok() //Result.toOption
+            .and_then(|p| String::from_utf8(p).ok()) //and again Result.toOption
         //Take everything after the nonce bytes and attempt to decrypt it
 
         /*
@@ -170,18 +171,47 @@ fn handle_client(
         */
     }
 
+    /// Encrypts a plaintext string using symmetric authenticated encryption (NaCl secretbox).
+    /// Returns a single byte vector containing the nonce prepended to the ciphertext,
+    /// so the receiver can extract the nonce and decrypt.
     fn encrypt_system_message(text: &str, key: &secretbox::Key) -> Vec<u8> {
+        // Generate a random one-time nonce (number used once) for this encryption
         let nonce = secretbox::gen_nonce();
+
+        // Start the output buffer with the raw nonce bytes (needed for decryption later)
         let mut msg = nonce.0.to_vec();
+
+        // Encrypt the text and append the ciphertext (+ auth tag) after the nonce
         msg.extend_from_slice(&secretbox::seal(text.as_bytes(), &nonce, key));
+
         msg
     }
+
+    /*
+    let encryptSystemMessage (text: string) (key: SecretboxKey) : byte[] =
+        // Generate a random nonce
+        let nonce = Secretbox.genNonce()
+
+        // Encrypt the plaintext using the key and nonce
+        let ciphertext = Secretbox.seal (Encoding.UTF8.GetBytes text) nonce key
+
+        // Prepend the nonce bytes to the ciphertext and return
+        Array.append nonce.Bytes ciphertext
+    */
 
     // ── Salt handshake ──────────────────────────────────────
     // Must happen before any encrypted traffic so the client
     // can derive the same key from the shared passphrase.
-    if send_salt(&mut stream, &salt).is_err() {
-        return;
+    /*
+    match send_salt(&mut stream, &salt) {
+        Ok(()) => {
+            // Salt was sent successfully — continue handling this client
+        }
+        Err(_) => {
+            // Something went wrong (client disconnected, network error, etc.)
+            // Abandon this client entirely
+            return;
+        }
     }
 
     // ── Receive + decrypt username ──────────────────────────
@@ -247,6 +277,138 @@ fn handle_client(
         .unwrap()
         .values()
         .for_each(|tx| { tx.send(leave_msg.clone()).ok(); });
+     */
+    //the code above using <<return>> works in Rust but not in F#. Here is the F#-yfied version:
+    match send_salt(&mut stream, &salt) {
+        Err(_) => {println!("Failed to send salt, client abandoned");} // failed to send salt — abandon client
+        Ok(()) => {
+            // ── Receive + decrypt username ──────────────────────────
+            let username = match read_message(&mut stream)
+                .ok() //the Result → Option conversion) happens before .and_then
+                //implicit Result.toOption
+                .and_then(|msg| decrypt_username(&msg, &key)) //Option.bind(fun msg -> decrypt_username msg key)
+
+            //the following code is just part of username
+            //a very specific Rust pattern called "let-else" or "unwrapping into a binding" - looks like function Some name -> name | None -> ...
+            {
+                Some(name) => name,
+                None => return, //return never produces a value, so Rust's type checker accepts it in any branch regardless of what type the other branches produce.
+            };
+
+            println!(">>> {} joined", username);
+
+            // ── Register client, spin up sender thread ──────────────
+            // Each client gets a channel. The sender thread drains it,
+            // writing every queued message to the TCP stream.
+            let (tx, rx) = mpsc::channel::<Vec<u8>>();
+            clients.lock().unwrap().insert(username.clone(), tx);
+            /*
+            Each client is effectively an actor
+            The mpsc channel is the mailbox
+            The tx handle stored in the HashMap is how other actors "address" this one
+            The sender thread is the actor's processing loop, handling messages one at a time
+
+            Why <Vec<u8>>?
+            This is Rust's turbofish syntax for specifying generic type parameters. channel() is a generic function — it can create a channel for any type. But Rust needs to know which type at compile time.
+            rustfn channel<T>() -> (Sender<T>, Receiver<T>)
+            So channel::<Vec<u8>>() is you telling the compiler: "I want a channel that carries Vec<u8> values." The <Vec<u8>> is slotted between the function name and the parentheses — hence the nickname "turbofish" (::<> looks like a fish).
+            You could often omit it and let Rust infer the type from context, but when inference isn't possible, you must be explicit.
+
+            Equivalent F# Code
+            F# uses MailboxProcessor for this pattern, which is its native actor model construct:
+            let inbox = MailboxProcessor<byte[]>.Start(fun agent ->
+                let rec loop () = async {
+                    let! msg = agent.Receive()
+                    stream.Write(msg, 0, msg.Length)
+                    return! loop ()
+                }
+                loop ()
+            )
+
+            clients[username] <- inbox.Post
+            The parallels are direct:
+
+            MailboxProcessor<byte[]> ↔ the channel typed as Vec<u8>
+            agent.Receive() ↔ rx.recv() — blocking wait for next message
+            inbox.Post ↔ tx — the handle you give to others to send messages
+            The rec loop ↔ the sender thread's while loop
+
+            Calling channel() returns a matched pair:
+
+            tx — the transmitter (sender side). You clone this and hand it to anyone who wants to send a message to this client.
+            rx — the receiver (consumer side). Only the sender thread holds this.
+
+            - **`clients`** is likely an `Arc<Mutex<HashMap<String, Sender<Vec<u8>>>>>`— a shared map of all connected users, protected by a mutex so multiple threads can safely access it.
+            - **`.lock()`** acquires the mutex lock. Only one thread can hold this at a time, preventing data races.
+            - **`.unwrap()`** handles the `Result` — if the mutex is *poisoned* (a thread panicked while holding it), this would panic too.
+            - **`.insert(username.clone(), tx)`** adds this client's username and their `tx` channel handle into the map.
+
+            */
+
+            /*
+            try_clone() duplicates the TCP socket at the OS level.
+            Both stream and writer point to the same underlying TCP connection, but are now two separate handles.
+            Spawns a new thread. The move keyword transfers ownership of writer and rx into the closure — the spawned thread owns them exclusively, which satisfies Rust's borrow checker.
+            ### The Architecture This Creates
+            ```
+            Other clients
+                 │
+                 │  tx.send(msg)          rx.into_iter()
+                 └──────────────► [channel] ──────────────► writer thread ──► TCP socket
+                                                                                    ║
+            main client thread ◄──────────────────────────────────────────────────╝
+            (read_message loop)
+            The channel acts as the mailbox (exactly like an F# MailboxProcessor). Any thread can drop a message in via tx.send() without caring about timing.
+            The writer thread drains the mailbox sequentially, ensuring messages don't get interleaved on the wire.
+            */
+            let mut writer = stream.try_clone().expect("clone failed");
+            thread::spawn(move || {
+                rx.into_iter()
+                    .try_for_each(|msg| send_message(&mut writer, &msg))
+                    .ok();
+            });
+
+            // Brief pause so the sender thread is ready before the
+            // join broadcast below hits the channel.
+            thread::sleep(std::time::Duration::from_millis(100));
+
+            // ── Broadcast join notice ───────────────────────────────
+            // System messages are encrypted by the server; chat
+            // messages are relayed as opaque ciphertext (never touched).
+            let join_msg = encrypt_system_message(&format!("{} joined", username), &key);
+            clients
+                .lock()
+                .unwrap()
+                .values()
+                .for_each(|tx| { tx.send(join_msg.clone()).ok(); });
+
+            // ── Relay loop: forward ciphertext verbatim ─────────────
+            // The server never decrypts chat messages — it reads each
+            // framed blob and fans it out to every other connected client.
+            std::iter::from_fn(|| read_message(&mut stream).ok())
+                .for_each(|encrypted| {
+                    clients
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .filter(|(name, _)| *name != &username)
+                        .for_each(|(_, tx)| { tx.send(encrypted.clone()).ok(); });
+                });
+
+            // ── Cleanup + broadcast leave notice ───────────────────
+            // Remove the client from the map first so the leave message
+            // is not echoed back to the departing client's (now closed) stream.
+            clients.lock().unwrap().remove(&username);
+            println!("<<< {} left", username);
+
+            let leave_msg = encrypt_system_message(&format!("{} left", username), &key);
+            clients
+                .lock()
+                .unwrap()
+                .values()
+                .for_each(|tx| { tx.send(leave_msg.clone()).ok(); });
+        }
+    }
 }
 
 // ============================================================
