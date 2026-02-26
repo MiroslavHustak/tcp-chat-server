@@ -67,7 +67,7 @@ let username =
 
 let username = 
     option {
-           let! raw = readMessage stream |> Option.ofResult         
+           let! msg = readMessage stream |> Option.ofResult         
            return! decryptUsername msg key
        } |> Option.defaultWith (fun () -> return ())
 ```
