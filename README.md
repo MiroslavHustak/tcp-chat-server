@@ -44,7 +44,7 @@ fn read_message(reader: &mut impl Read) -> io::Result<Vec<u8>> {
   }
  ```
 
-6)  "unwrap-or-early-return"
+5)  "unwrap-or-early-return"
 ```
 let username = 
     match read_message(&mut stream)
