@@ -84,7 +84,7 @@ I myself would contemplate like this during creating the Rust pattern matching e
 
 *If so, let's use those, and for all other combinations pure pattern matching will be used. If not, stick with the aforementioned `?/OptionOfResult()`.*
 
-To eliminate pyramids of doom, I am a strong proponent of monadic composition, monadic CEs, monad-inspired custom CEs and ROP-style function composition with pattern matching left to bare minimum (and with the if-else construct totally banned in my F# code).
+To eliminate pyramids of doom, I am a strong proponent of monadic composition, monadic CEs, monad-inspired custom CEs and ROP-style function composition with pattern matching left to bare minimum (and with the `if-else` construct totally banned in my F# code).
 
 But once the Rust creators chose to implement the Result/Option types (enums) where pattern matching leading to pyramids of doom is the necessary evil much like the borrow checker clashing with the FP-style dealing with the pyramids of doom :-), I think the "classic" pattern matching might be more readable than the "Malbolge-style" alternatives with `let...else` and friends. Despite the pyramids of doom.
 
