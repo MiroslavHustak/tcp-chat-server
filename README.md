@@ -9,7 +9,7 @@ February 26, 2026
 
 My percieved problem with the PM ergonomics (not considering the "classic" `if-else` construct here) is that there are too many (syntactically inconsistent, IMHO) control flow features - unlike the F# alternatives:
 
-1) classing pattern matching `(Ok(...) =>, Err(...) =>)`  
+1) classic pattern matching `(Ok(...) =>, Err(...) =>)`  
 
 2) if-let concept
 ```
