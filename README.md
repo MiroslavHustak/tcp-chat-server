@@ -66,10 +66,12 @@ let username =
     |> Option.defaultWith (fun () -> return ())
 
 let username = 
-    option {
+    option
+        {
            let! msg = readMessage stream |> Option.ofResult         
            return! decryptUsername msg key
-       } |> Option.defaultWith (fun () -> return ())
+        }
+    |> Option.defaultWith (fun () -> return ())
 ```
 Maybe the creators of Rust should have drawn inspiration from F# syntax and ergonomics - not only for PM, but for iterators and actor models as well.
 
