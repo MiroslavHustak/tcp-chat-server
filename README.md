@@ -9,20 +9,20 @@ February 26, 2026
 
 My percieved problem with the PM ergonomics (not considering the "classic" `if-else` construct here) is that there are too many (syntactically inconsistent, IMHO) control flow features - unlike the F# alternatives:
 
-1) classic pattern matching
+**1) classic pattern matching**
    
 ```
 (Ok(...) =>, Err(...) =>)
 ```
 
-2) if-let concept
+**2) if-let concept**
 ```
 if let Some(max) = config_max {
     println!("The maximum is configured to be {max}");
 }
 ```
 
-3) let...else concept 
+**3) let...else concept** 
 ```
 fn describe_state_quarter(coin: Coin) -> Option<String> {
     let Coin::Quarter(state) = coin else {
@@ -37,7 +37,7 @@ fn describe_state_quarter(coin: Coin) -> Option<String> {
 }
 ```
 
-4) the ? operator
+**4) the ? operator**
 ```
 fn read_message(reader: &mut impl Read) -> io::Result<Vec<u8>> {        
       let mut len_buf = [0u8; 4];         
@@ -48,7 +48,7 @@ fn read_message(reader: &mut impl Read) -> io::Result<Vec<u8>> {
   }
  ```
 
-5)  "unwrap-or-early-return"
+**5)  "unwrap-or-early-return"**
 ```
 let username = 
     match read_message(&mut stream)
