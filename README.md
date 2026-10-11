@@ -1,4 +1,4 @@
-Educational code for studying Rust syntax. Although it compiles and works, do not use the mostly vibe-coded code in production under any circumstances as it may contain flaws and hidden problems.
+*Educational code for studying Rust syntax. Although it compiles and works, do not use the mostly vibe-coded code in production under any circumstances as it may contain flaws and hidden problems.*
 
 ************************
 
